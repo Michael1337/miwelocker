@@ -6,15 +6,24 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"fmt"
+	"golang.org/x/crypto/pbkdf2"
 	"io"
 	"io/ioutil"
 	"os"
 	"strings"
 )
 
+const (
+	saltSize       = 16
+	keySize        = 32
+	iterations     = 100000
+	defaultExt     = "miwelocked"
+	usageMessage   = "Usage: go run miwelocker.go <encrypt/decrypt> <file> <password> [ID] [extension]"
+)
+
 func main() {
-	if len(os.Args) < 4 {
-		fmt.Println("Usage: go run miwelocker.go <encrypt/decrypt> <file> <password> [ID] [extension]")
+	if len(os.Args) < 4 || len(os.Args) > 6 {
+		fmt.Println(usageMessage)
 		return
 	}
 
@@ -24,12 +33,16 @@ func main() {
 
 	switch action {
 	case "encrypt":
-		if len(os.Args) < 6 {
-			fmt.Println("Usage for encryption: go run miwelocker.go encrypt <file> <password> <ID> <extension>")
+		if len(os.Args) < 5 {
+			fmt.Println("Usage for encryption: go run miwelocker.go encrypt <file> <password> <ID> [extension]")
 			return
 		}
 		id := os.Args[4]
-		extension := os.Args[5]
+		extension := defaultExt
+		if len(os.Args) == 6 {
+			extension = os.Args[5]
+			extension = strings.ReplaceAll(extension, ".", "") // remove additional dots in custom extensions for func removeIDAndExtension to work correctly
+		}
 		err := encryptFile(filePath, password, id, extension)
 		if err != nil {
 			fmt.Println("Error encrypting file:", err)
@@ -37,6 +50,10 @@ func main() {
 			fmt.Println("File encrypted successfully.")
 		}
 	case "decrypt":
+		if len(os.Args) != 4 {
+			fmt.Println("Usage for decryption: go run miwelocker.go decrypt <file> <password>")
+			return
+		}
 		err := decryptFile(filePath, password)
 		if err != nil {
 			fmt.Println("Error decrypting file:", err)
@@ -54,7 +71,13 @@ func encryptFile(filePath, password, id, extension string) error {
 		return err
 	}
 
-	block, err := aes.NewCipher(deriveKey(password))
+	salt := make([]byte, saltSize)
+	if _, err = io.ReadFull(rand.Reader, salt); err != nil {
+		return err
+	}
+
+	key := deriveKey(password, salt)
+	block, err := aes.NewCipher(key)
 	if err != nil {
 		return err
 	}
@@ -70,8 +93,10 @@ func encryptFile(filePath, password, id, extension string) error {
 	}
 
 	encryptedData := gcm.Seal(nonce, nonce, data, nil)
+	encryptedData = append(salt, encryptedData...)
+
 	newFilePath := fmt.Sprintf("%s.%s.%s", filePath, id, extension)
-	return ioutil.WriteFile(newFilePath, encryptedData, 0644)
+	return ioutil.WriteFile(newFilePath, encryptedData, 0600)
 }
 
 func decryptFile(filePath, password string) error {
@@ -80,7 +105,13 @@ func decryptFile(filePath, password string) error {
 		return err
 	}
 
-	block, err := aes.NewCipher(deriveKey(password))
+	if len(data) < saltSize {
+		return fmt.Errorf("ciphertext too short")
+	}
+
+	salt, data := data[:saltSize], data[saltSize:]
+	key := deriveKey(password, salt)
+	block, err := aes.NewCipher(key)
 	if err != nil {
 		return err
 	}
@@ -102,22 +133,21 @@ func decryptFile(filePath, password string) error {
 	}
 
 	originalFilePath := removeIDAndExtension(filePath)
-	return ioutil.WriteFile(originalFilePath, plainData, 0644)
+	return ioutil.WriteFile(originalFilePath, plainData, 0600)
 }
 
-func deriveKey(password string) []byte {
-	hash := sha256.Sum256([]byte(password))
-	return hash[:]
+func deriveKey(password string, salt []byte) []byte {
+	return pbkdf2.Key([]byte(password), salt, iterations, keySize, sha256.New)
 }
 
 func removeIDAndExtension(filePath string) string {
 	lastDot := strings.LastIndex(filePath, ".")
-	if lastDot == -1 {
-		return filePath
+	if strings.Count(filePath, ".") == 1 || lastDot == -1 {
+		return filePath // if string has no or just one dot, i. e. if someone removed the ID and MiweLocker extension
 	}
 	beforeLastDot := strings.LastIndex(filePath[:lastDot], ".")
 	if beforeLastDot == -1 {
-		return filePath[:lastDot]
+		return filePath[:lastDot] // if someone removed the MiweLocker extension, but not the ID
 	}
 	return filePath[:beforeLastDot]
 }
